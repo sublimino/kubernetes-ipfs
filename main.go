@@ -493,48 +493,57 @@ func handleStep(pods GetPodsOutput, step *Step, summary *Summary, env []string, 
 	r2, _ := regexp.Compile("\\[%i\\]")
 
 	// Initialize a channel with depth of number of nodes we're testing on simultaneously
-	outputStrings := make(chan []string)
-	outputErr := make(chan bool)
-	outputStringsErr := make(chan []string)
+	chanStdoutByLine := make(chan []string)
+	chanStderrByLine := make(chan []string)
+	chanIsTimeoutReached := make(chan bool)
 
 	for _, idx := range nodeIndices {
 		command := r1.ReplaceAllString(step.CMD, "["+strconv.Itoa(idx-1)+"]")
 		command = r2.ReplaceAllString(command, "["+strconv.Itoa(iter)+"]")
 		// Hand this channel to the pod runner and let it fill the queue
-		runInPodAsync(pods.Items[idx-1].Metadata.Name, command, tmpEnv, step.Timeout, outputStrings, outputErr, outputStringsErr)
+		runInPodAsync(
+			pods.Items[idx-1].Metadata.Name,
+			command,
+			tmpEnv,
+			step.Timeout,
+			chanStdoutByLine,
+			chanStderrByLine,
+			chanIsTimeoutReached,
+		)
 	}
 	// Iterate through the queue to pull out results one-by-one
 	// These may be out of order, but is there a better way to do this? Do we need them in order?
 	for j := 0; j < numNodes; j++ {
-		out := <-outputStrings
-		err := <-outputErr
-		outErr := <-outputStringsErr
-		if err {
+		podStdoutByLine := <-chanStdoutByLine
+		podStderrByLine := <-chanStderrByLine
+		isTimeoutReached := <-chanIsTimeoutReached
+
+		if isTimeoutReached {
 			summary.Timeouts++
 			continue // skip handling the output or other assertions since it timed out.
 		}
-		if len(outErr) != 0 {
+		if len(podStderrByLine) > 1 {
 			summary.Failures++
 			color.Set(color.FgRed)
 			fmt.Println("Async pod command FAILED!")
-			fmt.Printf("StdOut: %s", strings.Join(out, "\n"))
-			fmt.Printf("StdErr: %s\n", strings.Join(outErr, "\n"))
+			fmt.Printf("StdOut: %s", strings.Join(podStdoutByLine, "\n"))
+			fmt.Printf("StdErr: %s\n", strings.Join(podStderrByLine, "\n"))
 			color.Unset()
 			continue
 		}
 		if len(step.WriteToFile) != 0 {
-			errWrite := ioutil.WriteFile(step.WriteToFile, []byte(strings.Join(out, "\n")), 0664)
+			errWrite := ioutil.WriteFile(step.WriteToFile, []byte(strings.Join(podStdoutByLine, "\n")), 0664)
 			if errWrite != nil {
-				color.Red("Failed to write output file: %s", err)
+				color.Red("Failed to write output file: %s", isTimeoutReached)
 			}
 		}
 		if len(step.Outputs) != 0 {
 			for index, output := range step.Outputs {
-				if index >= len(out) {
+				if index >= len(podStdoutByLine) {
 					color.Red("Not enough lines in output. Skipping")
 					break
 				}
-				line := out[index]
+				line := podStdoutByLine[index]
 				if output.SaveTo != "" {
 					color.Magenta("### Saving output from line %d to variable %s: %s", output.Line, output.SaveTo, line)
 					env = append(env, output.SaveTo+"=\""+line+"\"")
@@ -550,11 +559,11 @@ func handleStep(pods GetPodsOutput, step *Step, summary *Summary, env []string, 
 		}
 		if len(step.Assertions) != 0 {
 			for _, assertion := range step.Assertions {
-				if assertion.Line >= len(out) {
+				if assertion.Line >= len(podStdoutByLine) {
 					color.Red("Not enough lines in output.Skipping assertions")
 					break
 				}
-				lineToAssert := out[assertion.Line]
+				lineToAssert := podStdoutByLine[assertion.Line]
 				value := ""
 				// Find an env that matches the ShouldBeEqualTo variable
 				// i.e. RESULT="abc abc" matches ShouldBeEqualTo: RESULT
@@ -653,9 +662,14 @@ func scaleTo(cfg *Config) error {
 	return nil
 }
 
-func runInPodAsync(name string, cmdToRun string, env []string, timeout int, chanStrings chan []string, chanTimeout chan bool, chanStringsErr chan []string) {
+func runInPodAsync(podName string, cmdToRun string, env []string, timeout int, chanStrings chan []string, chanStringsErr chan []string, chanTimeout chan bool) {
 	go func() {
-		var lines []string
+		var cmdStdoutByLine []string
+		var cmdStderrByLine []string
+		var cmdStdout bytes.Buffer
+		var cmdErrout bytes.Buffer
+		isTimeoutReached := false
+
 		envString := ""
 		for _, e := range env {
 			envString += e + " "
@@ -663,19 +677,16 @@ func runInPodAsync(name string, cmdToRun string, env []string, timeout int, chan
 		if envString != "" {
 			envString = envString + "&& "
 		}
-		cmd := exec.Command("kubectl", "exec", name, "-t", "--", "bash", "-c", envString+cmdToRun)
-		var out bytes.Buffer
-		var errout bytes.Buffer
-		cmd.Stdout = &out
-		cmd.Stderr = &errout
+		cmd := exec.Command("kubectl", "exec", podName, "-t", "--", "sh", "-c", envString+cmdToRun)
+		cmd.Stdout = &cmdStdout
+		cmd.Stderr = &cmdErrout
 		cmd.Start()
-		timeout_reached := false
 
 		// Handle timeouts
 		if timeout != 0 {
 			timer := time.AfterFunc(time.Duration(timeout)*time.Second, func() {
 				cmd.Process.Kill()
-				timeout_reached = true
+				isTimeoutReached = true
 				color.Set(color.FgRed)
 				fmt.Println("Command timed out after", timeout, "seconds")
 				color.Unset()
@@ -686,17 +697,18 @@ func runInPodAsync(name string, cmdToRun string, env []string, timeout int, chan
 			cmd.Wait()
 		}
 
-		lines = strings.Split(out.String(), "\n")
-		errLines := strings.Split(errout.String(), "\n")
-		
+		cmdStdoutByLine = strings.Split(cmdStdout.String(), "\n")
+		cmdStderrByLine = strings.Split(cmdErrout.String(), "\n")
+		if len(cmdErrout.String()) > 0 {
+			cmdStderrByLine = append(cmdStderrByLine, "INVOCATION STRING: "+"kubectl exec "+podName+" -t -- sh -c "+envString+cmdToRun)
+		}
+
 		// Feed our output into the channel.
-		chanStrings <- lines
-		chanTimeout <- timeout_reached
-		chanStringsErr <- errLines
+		chanStrings <- cmdStdoutByLine
+		chanStringsErr <- cmdStderrByLine
+		chanTimeout <- isTimeoutReached
 	}()
 }
-
-
 
 func selectNodes(step Step, config Config, subsetPartition map[int][]int) []int {
 	var nodes []int
