@@ -495,20 +495,32 @@ func handleStep(pods GetPodsOutput, step *Step, summary *Summary, env []string, 
 	// Initialize a channel with depth of number of nodes we're testing on simultaneously
 	outputStrings := make(chan []string)
 	outputErr := make(chan bool)
+	outputStringsErr := make(chan []string)
+
 	for _, idx := range nodeIndices {
 		command := r1.ReplaceAllString(step.CMD, "["+strconv.Itoa(idx-1)+"]")
 		command = r2.ReplaceAllString(command, "["+strconv.Itoa(iter)+"]")
 		// Hand this channel to the pod runner and let it fill the queue
-		runInPodAsync(pods.Items[idx-1].Metadata.Name, command, tmpEnv, step.Timeout, outputStrings, outputErr)
+		runInPodAsync(pods.Items[idx-1].Metadata.Name, command, tmpEnv, step.Timeout, outputStrings, outputErr, outputStringsErr)
 	}
 	// Iterate through the queue to pull out results one-by-one
 	// These may be out of order, but is there a better way to do this? Do we need them in order?
 	for j := 0; j < numNodes; j++ {
 		out := <-outputStrings
 		err := <-outputErr
+		outErr := <-outputStringsErr
 		if err {
 			summary.Timeouts++
 			continue // skip handling the output or other assertions since it timed out.
+		}
+		if len(outErr) != 0 {
+			summary.Failures++
+			color.Set(color.FgRed)
+			fmt.Println("Async pod command FAILED!")
+			fmt.Printf("StdOut: %s", strings.Join(out, "\n"))
+			fmt.Printf("StdErr: %s\n", strings.Join(outErr, "\n"))
+			color.Unset()
+			continue
 		}
 		if len(step.WriteToFile) != 0 {
 			errWrite := ioutil.WriteFile(step.WriteToFile, []byte(strings.Join(out, "\n")), 0664)
@@ -641,7 +653,7 @@ func scaleTo(cfg *Config) error {
 	return nil
 }
 
-func runInPodAsync(name string, cmdToRun string, env []string, timeout int, chanStrings chan []string, chanTimeout chan bool) {
+func runInPodAsync(name string, cmdToRun string, env []string, timeout int, chanStrings chan []string, chanTimeout chan bool, chanStringsErr chan []string) {
 	go func() {
 		var lines []string
 		envString := ""
@@ -674,13 +686,13 @@ func runInPodAsync(name string, cmdToRun string, env []string, timeout int, chan
 			cmd.Wait()
 		}
 
-		if errout.String() != "" {
-			fmt.Println(errout.String())
-		}
 		lines = strings.Split(out.String(), "\n")
+		errLines := strings.Split(errout.String(), "\n")
+		
 		// Feed our output into the channel.
 		chanStrings <- lines
 		chanTimeout <- timeout_reached
+		chanStringsErr <- errLines
 	}()
 }
 
