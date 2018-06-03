@@ -21,6 +21,8 @@ main()  {
   echo "Then navigate to localhost:3000 in your browser."
   echo
   echo "Awaiting go-ipfs startup..."
+
+  sleep 3
   kwaitpod go-ipfs
 
   echo "Pod is started, waiting for readiness..."

@@ -24,7 +24,7 @@ steps:
       - FILE
       - HASH
     cmd: ipfs cat $HASH | md5sum | cut -d ' ' -f 1
-    timeout: 40
+    timeout: 60
     assertions:
     - line: 0
       should_be_equal_to: FILE
@@ -34,7 +34,7 @@ steps:
       - FILE
       - HASH
     cmd: ipfs cat $HASH | md5sum | cut -d ' ' -f 1
-    timeout: 40
+    timeout: 60
     assertions:
     - line: 0
       should_be_equal_to: FILE
